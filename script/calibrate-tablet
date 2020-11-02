@@ -1,0 +1,417 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+### Configuration variables -------------------------------------------------
+
+# CONFIG_SCREEN is not set
+# CONFIG_MONITOR is not set
+# CONFIG_INPUT is not set
+# CONFIG_SCREEN_REGEX is not set
+# CONFIG_MONITOR_REGEX is not set
+# CONFIG_INPUT_REGEX is not set
+# CONFIG_DRY_RUN is not set
+# CONFIG_VERBOSE is not set
+
+CONFIG_DEFAULT_MONITOR=${CONFIG_DEFAULT_MONITOR:-HDMI-2}
+CONFIG_DEFAULT_SCREEN=${CONFIG_DEFAULT_SCREEN:-Screen}
+CONFIG_DEFAULT_INPUT=${CONFIG_DEFAULT_INPUT:-stylus}
+
+### Helper functions --------------------------------------------------------
+
+#
+# is_declared FILENAME LINE_NUMBER TYPE...
+#
+# Writes a warning message on stderr if a given type already declared.
+# Return 0 on success, 1 on failure.
+#
+function is_declared()
+{
+	file="$1"
+	line="$2"
+	shift 2
+
+	for id in "$@"
+	do
+		if [ "$(type -t $id)" != "" ]
+		then
+			echo "WARNING: $id not redeclared at $file:$line." >&2
+			return 1
+		fi
+	done
+
+	return 0
+}
+
+is_declared ${BASH_SOURCE[0]} $LINENO verbose && \
+function verbose()
+{
+	[ ${CONFIG_VERBOSE:-0} -eq 0 ] || printf "$*"
+}
+
+#
+# array_join DELIMITER [VALUES...]
+#
+# Join VALUES using DELIMITER.
+#
+is_declared ${BASH_SOURCE[0]} $LINENO array_join && \
+function array_join()
+{
+	[ $# -eq 1 ] && return 0
+
+	if [ $# -lt 2 ]
+	then
+		echo "ERROR: array_join:$LINENO: too few arguments." >&2
+		return 1
+	fi
+
+	local delim=$1
+	local fst=$2
+	shift 2
+
+	printf %s "$fst" "${@/#/$delim}"
+
+	return 0
+}
+
+#
+# arithm OPERATION OP1 OP2 [OPERANDS...]
+#
+# Perform an arithmetic OPERATION on operands.
+#
+is_declared ${BASH_SOURCE[0]} $LINENO arithm && \
+function arithm()
+{
+	if [ $# -lt 3 ]
+	then
+		echo "ERROR: arithm:$LINENO: too few arguments." >&2
+		return 1
+	fi
+
+	local op="$1"
+	shift 1
+
+	printf '%.5f' "$(bc <<< "scale=5; $(array_join "$op" "$@")")"
+
+	return 0
+}
+
+# __add OP1 OP2 [OPERANDS...]
+is_declared ${BASH_SOURCE[0]} $LINENO __add && \
+function __add()
+{
+	arithm "+" "$@"
+	return $?
+}
+
+# __mul OP1 OP2 [OPERANDS...]
+is_declared ${BASH_SOURCE[0]} $LINENO __mul && \
+function __mul()
+{
+	arithm "*" "$@"
+	return $?
+}
+
+# __div OP1 OP2 [OPERANDS...]
+is_declared ${BASH_SOURCE[0]} $LINENO __div && \
+function __div()
+{
+	arithm "/" "$@"
+	return $?
+}
+
+# __gonio [sin|cos|...] DEGREES
+is_declared ${BASH_SOURCE[0]} $LINENO __gonio && \
+function __gonio()
+{
+	awk -v angle=$2 'BEGIN {printf "%.5f", '$1'(angle/180*atan2(0, -1));}'
+	return $?
+}
+
+function ct_usage()
+{
+cat <<EOF
+Usage: [ENV] $1 [ARGS...]
+
+Arguments:
+	-h | --help		Display this message.
+
+	--screen=X:Y		X and Y is current screen size
+				Argument values may be delimited with any
+				of [ x:].
+				Optional. If not specified, xrandr will be
+				used to determine the values.
+				See --screen-regex.
+
+				May be passed as an environment variable
+				CONFIG_SCREEN.
+
+	--screen-regex=REGEX	Regular expression to match screen in xrandr
+				output.
+				Default value: $CONFIG_DEFAULT_SCREEN.
+
+				May be passed as an environment variable
+				CONFIG_SCREEN_REGEX.
+
+	--monitor=PX PY OX OY	PX and PY are monitor sizes.
+				OX and OY are screen offsets.
+				Argument values may be delimited with any
+				of [ x+:].
+				Optional. If not specified, xrandr will be
+				used to determine the values.
+				See --monitor-regex.
+
+				May be passed as an environment variable
+				CONFIG_MONITOR.
+
+	--monitor-regex=REGEX	Regular expression to match monitor in xrandr
+				output.
+				Default value: $CONFIG_DEFAULT_MONITOR.
+
+				May be passed as an environment variable
+				CONFIG_MONITOR_REGEX.
+
+	--input=INPUT		xinput device name.
+				Optional. If not specified, xinput list will
+				be used to determine the values.
+				Multiple values may be given by either:
+				 a) providing multiple --input=INPUT arguments
+				 b) concatenating values using ':' delimiter
+
+				May be passed as an environment variable
+				CONFIG_INPUT.
+
+	--input-regex=REGEX	Regular expression to match xinput list
+				output.
+
+				May be passed as an environment variable
+				CONFIG_INPUT_REGEX.
+
+	--dry-run		Print the coordinate transformation matrix
+				to stdout only.
+
+				May be passed as an environment variable
+				CONFIG_DRY_RUN.
+
+	--verbose		Verbose output.
+
+				May be passed as an environment variable
+				CONFIG_VERBOSE.
+EOF
+}
+
+# ct_argparse [ARGS...]
+function ct_argparse()
+{
+	local file="$1"
+	shift 1
+
+	for arg in "$@"
+	do
+		local val="${arg#*=}"
+		case ${arg%=*} in
+		-h|--help)
+			ct_usage "$file"
+			return 0
+			;;
+		--screen)
+			CONFIG_SCREEN="$val"
+			;;
+		--monitor)
+			CONFIG_MONITOR="$val"
+			;;
+		--monitor-regex)
+			CONFIG_MONITOR_REGEX="$val"
+			;;
+		--screen-regex)
+			CONFIG_SCREEN_REGEX="$val"
+			;;
+		--input)
+			if [ -z ${CONFIG_INPUT+x} ]
+			then
+				CONFIG_INPUT="$val"
+			else
+				CONFIG_INPUT+=":$val"
+			fi
+			;;
+		--input-regex)
+			CONFIG_INPUT_REGEX="$val"
+			;;
+		--dry-run)
+			CONFIG_DRY_RUN=1
+			;;
+		--verbose)
+			CONFIG_VERBOSE=1
+			;;
+		esac
+	done
+
+	return 0
+}
+
+function ct_get_screen()
+{
+	local IFS=$' x:'
+
+	if [ -z "${CONFIG_SCREEN+x}" ]
+	then
+		verbose "Getting screen size for ${CONFIG_SCREEN_REGEX:-${CONFIG_DEFAULT_SCREEN}}: "
+
+		CONFIG_SCREEN=($(xrandr | grep -Po "^${CONFIG_SCREEN_REGEX:-${CONFIG_DEFAULT_SCREEN}}.*current \K[0-9]* x [0-9]*"))
+		if [ ${#CONFIG_SCREEN[@]} -eq 0 ]
+		then
+			echo "ERROR: unable to determine screen size" \
+			     "using xrandr." >&2
+			return 1
+		fi
+
+		verbose "${CONFIG_SCREEN[*]}" "\n"
+		return 0
+	fi
+
+	CONFIG_SCREEN=(${CONFIG_SCREEN[@]})
+	return 0
+}
+
+function ct_get_monitor()
+{
+	local IFS=$' x+:'
+
+	if [ -z "${CONFIG_MONITOR+x}" ]
+	then
+		verbose "Getting monitor params for ${CONFIG_MONITOR_REGEX:-${CONFIG_DEFAULT_MONITOR}}: "
+
+		if ! xrandr | grep -q "^${CONFIG_MONITOR_REGEX:-${CONFIG_DEFAULT_MONITOR}} connected"
+		then
+			echo "ERROR: ${CONFIG_MONITOR_REGEX:-${CONFIG_DEFAULT_MONITOR}}"\
+			     "not plugged in." >&2
+			return 1
+		fi
+		CONFIG_MONITOR=($(
+			xrandr \
+			| grep -Po -m1 \
+		       	       "${CONFIG_MONITOR_REGEX:-${CONFIG_DEFAULT_MONITOR}} connected \K[^(]*"
+		))
+
+		verbose "${CONFIG_MONITOR[*]}" "\n"
+		return 0
+	fi
+
+	CONFIG_MONITOR=(${CONFIG_MONITOR[@]})
+	return 0
+}
+
+function ct_get_input()
+{
+	local IFS=$'\n:'
+
+	if [ -z "${CONFIG_INPUT+x}" ]
+	then
+		verbose "Getting inputs for ${CONFIG_INPUT_REGEX:-$CONFIG_DEFAULT_INPUT}: "
+
+		CONFIG_INPUT=($(xinput list | grep -Po "^[^[:alnum:]]*\K.*${CONFIG_INPUT_REGEX:-$CONFIG_DEFAULT_INPUT}.*(?<=[[:alnum:]])(?=\s+id)"))
+
+		verbose "${CONFIG_INPUT[*]}" "\n"
+		return 0
+	fi
+
+	CONFIG_INPUT=(${CONFIG_INPUT[@]})
+	return 0
+}
+
+function ct_calc_matrix()
+{
+	# C1_1 is a relative horizontal size
+	#      monitor width / screen width
+
+	# C2_2 is a relative vertical size
+	#      monitor height / screen height
+
+	# C1_3 (C1_4) is a relative horizontal (vertial) offset
+	#      horizontal (vertial) offset / screen width (height)
+
+	# there are special cases to how horizontal (vertical) offsets are
+	# measured, depending on monitor orientation:
+	#     none       (0 deg)
+	#          horizontal offset := monitor x offset / screen width
+	#          vertical offset   := monitor y offset / screen height
+	#
+	#     left      (90 deg)
+	#          tmp := (monitor x offset + monitor width)
+	#          horizontal offset := tmp / screen width
+	#          vertical the same as with none
+	#
+	#     right    (270 deg)
+	#          tmp := (monitor y offset + monitor height)
+	#          vertical offset := tmp / screen height
+	#          horizontal the same as with none
+	#
+	#     inverted (180 deg)
+	#          horizontal from left, vertical from right
+
+	local C1_1=$(__div ${CONFIG_MONITOR[0]} ${CONFIG_SCREEN[0]})
+	local C2_2=$(__div ${CONFIG_MONITOR[1]} ${CONFIG_SCREEN[1]})
+	local C1_3=$(__div ${CONFIG_MONITOR[2]} ${CONFIG_SCREEN[0]})
+	local C2_3=$(__div ${CONFIG_MONITOR[3]} ${CONFIG_SCREEN[1]})
+
+	case ${CONFIG_MONITOR[4]:-} in
+	left)
+		ANGLE=90
+		C1_3=$(__div $(__add ${CONFIG_MONITOR[2]} ${CONFIG_MONITOR[0]}) ${CONFIG_SCREEN[0]})
+		;;
+	right)
+		ANGLE=270
+		C2_3=$(__div $(__add ${CONFIG_MONITOR[3]} ${CONFIG_MONITOR[1]}) ${CONFIG_SCREEN[1]})
+		;;
+	inverted)
+		ANGLE=180
+		C1_3=$(__div $(__add ${CONFIG_MONITOR[2]} ${CONFIG_MONITOR[0]}) ${CONFIG_SCREEN[0]})
+		C2_3=$(__div $(__add ${CONFIG_MONITOR[3]} ${CONFIG_MONITOR[1]}) ${CONFIG_SCREEN[1]})
+		;;
+	esac
+
+	# apply rotation, if any
+	if [ ${ANGLE:-0} -gt 0 ]
+	then
+		local COS_A=$(__gonio cos ${ANGLE:-0})
+		local SIN_A=$(__gonio sin ${ANGLE:-0})
+
+		C1_2=$(__mul $C1_1 $SIN_A -1.0)
+		C1_1=$(__mul $C1_1 $COS_A)
+		C2_1=$(__mul $C2_2 $SIN_A)
+		C2_2=$(__mul $C2_2 $COS_A)
+	fi
+
+	COORD_TRANSFORM_MATRIX=(
+		${C1_1:-0} ${C1_2:-0} ${C1_3:-0}
+		${C2_1:-0} ${C2_2:-0} ${C2_3:-0}
+		${C3_1:-0} ${C3_2:-0} ${C3_3:-1}
+	)
+}
+
+function ct_main()
+{
+	ct_argparse "$0" "$@"
+
+	ct_get_screen
+	ct_get_monitor
+	ct_get_input
+	ct_calc_matrix
+
+	IFS=$'\n'
+	for input in ${CONFIG_INPUT[@]}
+	do
+		if [ ${CONFIG_DRY_RUN:-0} -eq 1 ]
+		then
+			echo $input
+			echo ${COORD_TRANSFORM_MATRIX[@]}
+			continue
+		fi
+		xinput set-prop "$input" --type=float 'Coordinate Transformation Matrix' ${COORD_TRANSFORM_MATRIX[@]}
+	done
+}
+
+if [ "${BASH_SOURCE[0]}" == "${0}" ]
+then
+	ct_main "$0" "$@"
+fi
