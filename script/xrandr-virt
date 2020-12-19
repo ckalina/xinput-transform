@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+MODE=()
+VIRTUAL=()
+MONITORS_VIRT_DEL=()
+
+# Get current resolution on $1 output
+function xrandr_get_resolution()
+{
+	xrandr \
+	| grep -Pzo "(^|\n)$1 connected.*\n\s*\K[0-9]+x[0-9]+(?=[^*]*)" \
+	| tr 'x' ' ' \
+	| tr -d '\0'
+}
+
+function xrandr_get_rotation()
+{
+	xrandr \
+	| grep -Po "^$1.* [0-9]+x[0-9]+\+[0-9]+\+[0-9]+ \K(left|right|inverted|)(?= \()"
+}
+
+function xrandr_get_mm()
+{
+	xrandr \
+	| grep -Po "(^|\n)$1 connected.* \K[0-9]+mm x [0-9]+mm" \
+	| tr -d '[[:alpha:]]'
+}
+
+function xrandr_calc_virtual()
+{
+	line=$1
+	xoffset=$2
+	yoffset=$3
+	_xoffset=$4
+	_yoffset=$5
+
+	width_raw=${line%%x*}
+	height=${line#*x}
+
+	case ${height: -1} in
+	%)
+		height=$((${MODE[1]}*${height:0:-1}/100))
+		;;
+	p)
+		height=${height:0:-1}
+		;;
+	*)
+		echo "Unsupported height \`$height'." >&2
+		xrandr_virt_usage
+		exit 1
+		;;
+	esac
+
+	correction_y=$((${MODE[1]} - $yoffset - $height))
+	if [ $correction_y -lt 0 ]
+	then
+		echo "Warning: y-overflow detected." >&2
+		height=$(($height+$correction_y))
+	fi
+
+	if [ $height -le 0 ]
+	then
+		echo "Warning: zero virtual monitor size" \
+			"after correction." >&2
+		continue
+	fi
+
+	if [[ "${width_raw}" =~ ^[0-9]*$ ]]
+	then
+		width_raw="$(
+			printf "$((100/$width_raw))%% %.0s" $(seq 1 1 $width_raw)
+		)"
+	fi
+
+	width_arr=()
+	for width in ${width_raw//,/ }
+	do
+		case ${width: -1} in
+		%)
+			width=$((${MODE[0]}*${width:0:-1}/100))
+			;;
+		p)
+			width=${width:0:-1}
+			;;
+		*)
+			width=$((${MODE[0]}*$width/100))
+			;;
+		esac
+
+		correction_x=$((${MODE[0]} - $xoffset - $width))
+		if [ $correction_x -lt 0 ]
+		then
+			echo "Warning: x-overflow detected." >&2
+			width=$(($width+$correction_x))
+		fi
+
+		if [ $width -gt 0 ]
+		then
+			WIDTH+=($width)
+			HEIGHT+=($height)
+			OFFSET_X+=($((xoffset+_xoffset)))
+			OFFSET_Y+=($((yoffset+_yoffset)))
+		else
+			echo "Warning: zero virtual monitor size" \
+				"after correction." >&2
+		fi
+
+		xoffset=$(($xoffset+$width))
+	done
+
+	yoffset=$(($yoffset+$height))
+}
+
+function xrandr_virt_usage() {
+cat <<EOF
+Usage: ${BASH_SOURCE[0]} [OPTION]
+
+Setup virtual monitors according to a grid specification.
+
+Options:
+	--output=<output>
+	--delmonitor=<name>
+	--mode=<mode>
+	--rotate=<rotate>
+	--virtual=<grid>	Grid specification.
+				May be specified multiple times.
+	--fb=<width>x<height>
+	--voutput=<name>
+	--replace=<name>
+	--delmonitor=<name>	Delete a monitor <name>.
+	--no-del		Does not automatically delete monitors
+				on given screen.
+
+Grid specification:
+	<grid> := <horizontal_list>x<vertical>
+
+	Specifies a grid element of <vertical> height. Valid values are:
+		<number>p	<number> pixels
+		<number>%	<number> percents of the display height
+				(after rotation application)
+
+	Each such vertically-specified region is placed right under previously
+	stated grid elements andmay be subdivided horizontally:
+
+		<horizontal_list> := <horizontal_list>,<number>p
+				  |  <horizontal_list>,<number>%
+				  |
+
+	Grid specification will be compensated upon overflow.
+
+	To get more complicated layouts, simply call the script in steps:
+		1) split vertically as detailed above,
+		2) apply any layout on a virtual monitor.
+	See examples below.
+
+Remarks:
+
+	After having finished setting up the grid, the script calls
+		xrandr --fb
+	This could cause isses with multi-monitor setups. Either pass
+	--fb argument, or specify CONFIG_FB environment variable.
+
+Examples:
+
+   ,------ HDMI-1~0
+   v
+.----------------------------.
+| 200px by 20% of the screen | <--- --virtual=200px20%
+|----------------------------|
+|  30%   | 100px | remaining | <--- --virtual=30%,100p,100%x80% or
+|  by    | by    | space     |   |   
+|  80%   | 80%   |           |   |  --virtual=30%x80%
+|        |       |           |   '- --virtual=100px80%
+'............................'      --virtual=100%x80%
+   ^        ^       ^
+   |        |       '--- HDMI-1~3
+   |        '----------- HDMI-1~2
+   '-------------------- HDMI-1~1
+
+
+   ,-------- HDMI-1~0     ,---------- HDMI-1~1~0
+   v                      v
+.----------------------------.
+|        |   70% by 200px    |
+|        |-------------------| ./${BASH_SOURCE[0]} --virtual=30%,70%x100%
+|  30%   |                   |     produces the vertical split that will
+|  by    |  remaining space  |     subsequently be replaced: 
+|  100%  |                   | ./${BASH_SOURCE[0]} --virtual=100%x200p \ 
+|        |                   |                     --virtual=100%x100% \ 
+'............................'                     --replace=HDMI-1~1
+                          ^
+			  '--------- HDMI-1~1~1
+
+EOF
+exit
+}
+
+# Process arguments
+for arg in "$@"
+do
+	argval=${arg#*=}
+	case ${arg%%=*} in
+	--output)
+		OUTPUT=$argval
+		;;
+	--replace)
+		MONITOR_REPLACE=$argval
+		MONITOR_VIRT_NO_AUTO_DEL=1
+		MONITORS_VIRT_DEL+=($argval)
+		;;
+	--mode)
+		MODE=(${argval%%x*} ${argval#*x})
+		;;
+	--rotate)
+		ROTATE=$argval
+		;;
+	--virtual)
+		VIRTUAL+=(${argval//;/ })
+		;;
+	--delmonitor)
+		MONITORS_VIRT_DEL+=($argval)
+		;;
+	--no-del)
+		MONITOR_VIRT_NO_AUTO_DEL=1
+		;;
+	--help)
+		xrandr_virt_usage
+		;;
+	--fb)
+		CONFIG_FB=$argval
+		;;
+	esac
+done
+
+if [ $# -eq 0 ]
+then
+	xrandr_virt_usage
+fi
+
+# Set output, detect if not given
+if [ -z ${OUTPUT+x} ]
+then
+	OUTPUT_DETECTED=($(
+		xrandr \
+		| grep -Po "^.*(?= connected)"
+	))
+
+	if [ ${#OUTPUT_DETECTED[@]} -gt 1 ]
+	then
+		cat >&2 <<-EOF
+		Unable to autodetect output, multiple choices available:${OUTPUT_DETECTED[@]/#/
+ - }
+		EOF
+		xrandr_virt_usage
+		exit 1
+	fi
+
+	OUTPUT=${OUTPUT_DETECTED[0]}
+fi
+
+# Detect current resolution (modulo rotation)
+if [ -z ${MODE+x} ]
+then
+	MODE=($(xrandr_get_resolution $OUTPUT))
+fi
+
+if [ -z ${ROTATE+x} ]
+then
+	ROTATE=$(xrandr_get_rotation $OUTPUT)
+fi
+
+MM=($(xrandr_get_mm $OUTPUT))
+
+XRANDR_PARAM=()
+
+if [ -z "${MONITOR_REPLACE+x}" ]
+then
+	XRANDR_PARAM=(
+		--output $OUTPUT
+		--rotate $ROTATE
+		--mode ${MODE[0]}x${MODE[1]}
+	)
+fi
+
+case $ROTATE in
+normal|invert)
+	;;
+right|left)
+	MODE=( ${MODE[1]} ${MODE[0]} )
+	MM=( ${MM[1]} ${MM[0]} )
+	;;
+esac
+
+CONFIG_FB=${CONFIG_FB:-${MODE[0]}x${MODE[1]}}
+
+WIDTH=()
+HEIGHT=()
+OFFSET_X=()
+OFFSET_Y=()
+
+# Calculate virtual monitor offsets
+if [ ${#VIRTUAL[@]} -gt 0 ]
+then
+	if [ -n "${MONITOR_REPLACE:-}" ]
+	then
+		monitor=($(
+			xrandr --listmonitors \
+			| grep -Po "$MONITOR_REPLACE \K.*" \
+			| sed 's/[^0-9]/ /g'
+		))
+		MODE=(${monitor[0]} ${monitor[2]})
+		MM=(${monitor[1]} ${monitor[3]})
+		_xoffset=${monitor[4]}
+		_yoffset=${monitor[5]}
+	fi
+
+	yoffset=0
+	for line in ${VIRTUAL[@]}
+	do
+		echo $line
+		xoffset=0
+		xrandr_calc_virtual $line $xoffset $yoffset \
+			${_xoffset:-0} ${_yoffset:-0}
+	done
+fi
+
+if [ ${#MONITORS_VIRT_DEL[@]} -eq 0 -a ${MONITOR_VIRT_NO_AUTO_DEL:-0} -eq 0 ]
+then
+	MONITORS_VIRT_DEL+=($(
+		xrandr --listactivemonitors \
+		| grep -o "$OUTPUT~[^ ]*"
+	))
+fi
+
+XRANDR_PARAM+=(
+	${MONITORS_VIRT_DEL[@]/#/ --delmonitor }
+)
+
+XRANDR_PARAM_NEW=()
+for i in $(seq 0 1 $((${#WIDTH[@]}-1)))
+do
+	[ $i -eq 0 -a -z "${MONITOR_REPLACE+x}" ] && mon=$OUTPUT || mon=none
+
+	param=${WIDTH[$i]}/$(((${WIDTH[$i]}*${MM[0]})/${MODE[0]}))
+	param+=x${HEIGHT[$i]}/$(((${HEIGHT[$i]}*${MM[1]})/${MODE[1]}))
+	param+=+${OFFSET_X[$i]}+${OFFSET_Y[$i]}
+
+	XRANDR_PARAM+=(--setmonitor ${MONITOR_REPLACE:-$OUTPUT}~$i $param $mon)
+done
+
+xrandr ${XRANDR_PARAM[@]} --fb ${CONFIG_FB}
+i3-msg reload
