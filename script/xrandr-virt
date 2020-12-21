@@ -18,7 +18,8 @@ function xrandr_get_resolution()
 function xrandr_get_rotation()
 {
 	xrandr \
-	| grep -Po "^$1.* [0-9]+x[0-9]+\+[0-9]+\+[0-9]+ \K(left|right|inverted|)(?= \()"
+	| grep -Po "^$1.* [0-9]+x[0-9]+\+[0-9]+\+[0-9]+ \K(left|right|inverted|)(?= \()" \
+	|| :
 }
 
 function xrandr_get_mm()
@@ -26,6 +27,13 @@ function xrandr_get_mm()
 	xrandr \
 	| grep -Po "(^|\n)$1 connected.* \K[0-9]+mm x [0-9]+mm" \
 	| tr -d '[[:alpha:]]'
+}
+
+function xrandr_get_offset()
+{
+	xrandr \
+	| grep -Po "^$1.* [0-9]+x[0-9]+\+\K[0-9]+\+[0-9]+" \
+	| tr '+' ' '
 }
 
 function xrandr_calc_virtual()
@@ -100,8 +108,8 @@ function xrandr_calc_virtual()
 		then
 			WIDTH+=($width)
 			HEIGHT+=($height)
-			OFFSET_X+=($((xoffset+_xoffset)))
-			OFFSET_Y+=($((yoffset+_yoffset)))
+			OFFSET_X+=($((xoffset+_xoffset+${MODE_OFFSET[0]})))
+			OFFSET_Y+=($((yoffset+_yoffset+${MODE_OFFSET[1]})))
 		else
 			echo "Warning: zero virtual monitor size" \
 				"after correction." >&2
@@ -260,6 +268,12 @@ then
 	OUTPUT=${OUTPUT_DETECTED[0]}
 fi
 
+if [ -z "${OUTPUT:-}" ]
+then
+	echo "No output given."
+	exit
+fi
+
 # Detect current resolution (modulo rotation)
 if [ -z ${MODE+x} ]
 then
@@ -269,7 +283,13 @@ fi
 if [ -z ${ROTATE+x} ]
 then
 	ROTATE=$(xrandr_get_rotation $OUTPUT)
+	if [ -z "$ROTATE" ]
+	then
+		ROTATE=normal
+	fi
 fi
+
+MODE_OFFSET=($(xrandr_get_offset $OUTPUT))
 
 MM=($(xrandr_get_mm $OUTPUT))
 
@@ -330,13 +350,17 @@ if [ ${#MONITORS_VIRT_DEL[@]} -eq 0 -a ${MONITOR_VIRT_NO_AUTO_DEL:-0} -eq 0 ]
 then
 	MONITORS_VIRT_DEL+=($(
 		xrandr --listactivemonitors \
-		| grep -o "$OUTPUT~[^ ]*"
+		| grep -o "$OUTPUT~[^ ]*" \
+		|| :
 	))
 fi
 
-XRANDR_PARAM+=(
-	${MONITORS_VIRT_DEL[@]/#/ --delmonitor }
-)
+if [ ${#MONITORS_VIRT_DEL[@]} -gt 0 ]
+then
+	XRANDR_PARAM+=(
+		${MONITORS_VIRT_DEL[@]/#/ --delmonitor }
+	)
+fi
 
 XRANDR_PARAM_NEW=()
 for i in $(seq 0 1 $((${#WIDTH[@]}-1)))
